@@ -119,7 +119,7 @@ docs/           技术文档 Markdown 源文件
 | 成员 2（AI 链路 / Prompt） | 邱宇航 |
 | 成员 3（文档 / 视频 / 部署） | 刘梦琦 |
 | 指导教师 | 尹剑飞 |
-| 代码仓库 | 【GitHub / Gitee 公开链接】 |
+| 代码仓库 | https://github.com/hulk-123a/ai-report-checker |
 
 ## 许可
 
