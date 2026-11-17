@@ -9,3 +9,6 @@ npm-debug.log*
 coverage/
 .vite/
 *.tsbuildinfo
+
+# 演示视频体积较大，只随提交包分发，不进代码仓库
+演示视频.mp4
