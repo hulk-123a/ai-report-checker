@@ -1,7 +1,8 @@
 import { useCallback, useReducer, useRef } from 'react';
 import { runCheck, validateResults, type CheckOutput } from '../lib/agent';
-import { buildDoc, parseFile } from '../lib/parse';
+import { buildDoc, parseFile, parseImage } from '../lib/parse';
 import { retrieve } from '../lib/retrieve';
+import { isSpeechSupported, startVoiceToText, type VoiceSession } from '../lib/multimodal';
 import {
   SAMPLE_RAW_RESULTS,
   SAMPLE_REPORT_TEXT,
@@ -28,6 +29,9 @@ interface State {
   timeline: TimelineItem[];
   streaming: string;
   error: string;
+  /** 语音听写中的临时文本（多模态入口） */
+  voiceDraft: string;
+  listening: boolean;
 }
 
 const initialState: State = {
@@ -40,6 +44,8 @@ const initialState: State = {
   timeline: [],
   streaming: '',
   error: '',
+  voiceDraft: '',
+  listening: false,
 };
 
 type Action =
@@ -50,6 +56,8 @@ type Action =
   | { type: 'success'; payload: CheckOutput }
   | { type: 'demo'; task: ParsedDoc; report: ParsedDoc; payload: CheckOutput }
   | { type: 'error'; message: string }
+  | { type: 'voiceDraft'; text: string }
+  | { type: 'listening'; value: boolean }
   | { type: 'reset' };
 
 function withTimeline(state: State, stage: Stage, label: string, detail?: string): TimelineItem[] {
@@ -103,6 +111,10 @@ function reducer(state: State, action: Action): State {
         error: action.message,
         timeline: withTimeline(state, 'error', '核查中断', action.message),
       };
+    case 'voiceDraft':
+      return { ...state, voiceDraft: action.text };
+    case 'listening':
+      return { ...state, listening: action.value };
     case 'reset':
       return initialState;
     default:
@@ -137,6 +149,75 @@ export function useChecker() {
     }
     const doc = buildDoc(name, text, kind === 'task' ? 't' : 'r');
     dispatch(kind === 'task' ? { type: 'setTask', doc } : { type: 'setReport', doc });
+  }, []);
+
+  /** 图像模态：视觉模型 OCR → 统一文档结构 */
+  const loadImage = useCallback(async (kind: DocKind, file: File) => {
+    dispatch({ type: 'stage', stage: 'parsing', label: `视觉识别 ${file.name}` });
+    dispatch({ type: 'stage', stage: 'idle', label: '图像 OCR 进行中', detail: '调用视觉模型提取文字' });
+    try {
+      const doc = await parseImage(file, kind === 'task' ? 't' : 'r');
+      dispatch(kind === 'task' ? { type: 'setTask', doc } : { type: 'setReport', doc });
+      dispatch({
+        type: 'stage',
+        stage: 'idle',
+        label: `${file.name} 图像识别完成`,
+        detail: `OCR 提取 ${doc.text.length} 字符 / ${doc.chunks.length} 个片段`,
+      });
+    } catch (error) {
+      dispatch({ type: 'error', message: error instanceof Error ? error.message : String(error) });
+    }
+  }, []);
+
+  const voiceSessionRef = useRef<VoiceSession | null>(null);
+  const voiceKindRef = useRef<DocKind>('task');
+
+  /** 语音模态：浏览器端语音识别，识别完成自动汇入对应文档（与文本/图像同一链路） */
+  const toggleVoice = useCallback((kind: DocKind) => {
+    if (voiceSessionRef.current) {
+      voiceSessionRef.current.stop();
+      voiceSessionRef.current = null;
+      dispatch({ type: 'listening', value: false });
+      return;
+    }
+    if (!isSpeechSupported()) {
+      dispatch({ type: 'error', message: '当前浏览器不支持语音识别，请使用 Chrome / Edge' });
+      return;
+    }
+    voiceKindRef.current = kind;
+    const targetKind = kind;
+    dispatch({ type: 'voiceDraft', text: '' });
+    dispatch({ type: 'listening', value: true });
+    const session = startVoiceToText(
+      (text) => dispatch({ type: 'voiceDraft', text }),
+      (message) => {
+        dispatch({ type: 'error', message });
+        dispatch({ type: 'listening', value: false });
+        voiceSessionRef.current = null;
+      },
+    );
+    voiceSessionRef.current = session;
+    session.done
+      .then((finalText) => {
+        dispatch({ type: 'listening', value: false });
+        voiceSessionRef.current = null;
+        if (finalText.length < 30) {
+          dispatch({ type: 'error', message: '语音识别内容过短，请至少口述 30 字' });
+          return;
+        }
+        const doc = buildDoc(`语音口述-${targetKind === 'task' ? '任务书' : '报告'}.txt`, finalText, targetKind === 'task' ? 't' : 'r');
+        dispatch(targetKind === 'task' ? { type: 'setTask', doc } : { type: 'setReport', doc });
+        dispatch({
+          type: 'stage',
+          stage: 'idle',
+          label: '语音转写完成',
+          detail: `已汇入${targetKind === 'task' ? '任务书' : '报告'} · ${finalText.length} 字符`,
+        });
+      })
+      .catch(() => {
+        dispatch({ type: 'listening', value: false });
+        voiceSessionRef.current = null;
+      });
   }, []);
 
   const run = useCallback(async () => {
@@ -210,5 +291,16 @@ export function useChecker() {
 
   const busy = ['parsing', 'extracting', 'retrieving', 'judging'].includes(state.stage);
 
-  return { state, loadFile, loadText, run, cancel, loadDemo, reset: () => dispatch({ type: 'reset' }), busy };
+  return {
+    state,
+    loadFile,
+    loadText,
+    loadImage,
+    toggleVoice,
+    run,
+    cancel,
+    loadDemo,
+    reset: () => dispatch({ type: 'reset' }),
+    busy,
+  };
 }

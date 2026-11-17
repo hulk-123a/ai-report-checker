@@ -1,6 +1,8 @@
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import type { ParsedDoc } from '../types';
 import { chunkText } from './chunk';
+import { callLlmText, fileToDataUrl, type ChatMessage } from './llm';
+import { IMAGE_OCR_PROMPT } from './multimodal';
 
 function normalize(raw: string): string {
   return raw
@@ -52,4 +54,32 @@ export async function parseFile(file: File, prefix: string): Promise<ParsedDoc> 
     throw new Error('未能从文件中提取到有效文字（扫描件请先转成文字版 PDF 或直接粘贴）');
   }
   return buildDoc(file.name, raw, prefix);
+}
+
+/**
+ * 图像模态：把报告/任务书截图交给服务端视觉模型做 OCR，转成纯文本后构建文档。
+ * 图片在浏览器端转 data URL 直接发送，不落服务器磁盘；转换结果回流到统一核查链路。
+ */
+export async function parseImage(file: File, prefix: string, signal?: AbortSignal): Promise<ParsedDoc> {
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+  if (!['png', 'jpg', 'jpeg', 'webp', 'bmp'].includes(ext)) {
+    throw new Error('图片仅支持 PNG / JPG / JPEG / WEBP / BMP');
+  }
+  const dataUrl = await fileToDataUrl(file);
+  const messages: ChatMessage[] = [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: IMAGE_OCR_PROMPT },
+        { type: 'image_url', image_url: { url: dataUrl, detail: 'high' } },
+      ],
+    },
+  ];
+  const raw = await callLlmText(messages, { vision: true, maxTokens: 4096, temperature: 0, signal });
+  if (normalize(raw).length < 30) {
+    throw new Error('图片未能识别出足够文字，请更换清晰度更高的截图或改用粘贴文本');
+  }
+  const doc = buildDoc(`${file.name}（OCR）`, raw, prefix);
+  doc.name = `${file.name} · 图像OCR`;
+  return doc;
 }

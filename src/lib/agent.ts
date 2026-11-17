@@ -8,7 +8,7 @@ import type {
   Requirement,
   Stage,
 } from '../types';
-import { callLlm, type ChatMessage } from './llm';
+import { callLlm, callLlmText, type ChatMessage, type ToolDef, type ToolCall } from './llm';
 import { retrieve } from './retrieve';
 
 const SYSTEM_PROMPT = `你是「核查镜」——面向高校实训课程的材料一致性核查 Agent。
@@ -197,31 +197,69 @@ export interface CheckOutput {
   bundles: EvidenceBundle[];
 }
 
-/**
- * 两阶段 Agent 工作流：
- * 规划(拆解要求) → 检索取证(BM25 工具) → 逐条判定 → 证据链校验
- * 全程只需 2 次模型调用，适配单接口、低额度、短开发周期。
- */
-export async function runCheck(options: RunCheckOptions): Promise<CheckOutput> {
-  const { taskText, report, onStage, onDelta, signal } = options;
-  const system: ChatMessage = { role: 'system', content: SYSTEM_PROMPT };
+/** 供模型调用的「检索工具」定义（OpenAI Function Calling 规范） */
+export const RETRIEVE_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'retrieve_evidence',
+    description:
+      '在实践报告中检索与某条要求相关的原文片段。输入检索意图与关键词，返回最相关的报告片段编号与原文。当需要对某条要求取证时必须调用本工具。',
+    parameters: {
+      type: 'object',
+      properties: {
+        requirement_id: { type: 'string', description: '要求项编号，如 Q1' },
+        intent: { type: 'string', description: '用一句话描述要找什么证据' },
+        keywords: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '检索关键词，中文名词或短语，2~6 个',
+        },
+      },
+      required: ['intent', 'keywords'],
+    },
+  },
+};
 
-  onStage('extracting', '阶段 1/3 · 拆解任务书要求', 'Agent 正在规划可核查项');
-  const requirementRaw = await callLlm(
-    [system, { role: 'user', content: extractPrompt(taskText) }],
-    { maxTokens: 2048, signal },
-  );
-  const requirements = normalizeRequirements(parseJsonArray(requirementRaw));
-  if (requirements.length === 0) {
-    throw new Error('未能从任务书抽取到要求项，请检查任务书是否为有效文字内容');
+/** 解析模型发起的工具调用；参数非法时返回 null，交由降级路径处理 */
+function parseToolArgs(call: ToolCall): { requirementId: string; intent: string; keywords: string[] } | null {
+  if (call.function.name !== 'retrieve_evidence') return null;
+  try {
+    const args = JSON.parse(call.function.arguments) as Record<string, unknown>;
+    const intent = String(args.intent ?? '').trim();
+    const keywords = Array.isArray(args.keywords)
+      ? args.keywords.filter((k): k is string => typeof k === 'string' && k.trim().length > 0).slice(0, 8)
+      : [];
+    if (!intent && keywords.length === 0) return null;
+    return { requirementId: String(args.requirement_id ?? '').trim(), intent, keywords };
+  } catch {
+    return null;
   }
+}
 
-  onStage(
-    'retrieving',
-    `阶段 2/3 · 检索报告证据（${requirements.length} 条要求）`,
-    'BM25 + 章节标题加权，纯前端检索增强',
-  );
-  const bundles: EvidenceBundle[] = requirements.map((requirement) => {
+/** 执行检索工具：真正调用本地 BM25 引擎，返回可追溯的证据包 */
+function executeRetrieveTool(
+  call: ToolCall,
+  requirements: Requirement[],
+  report: ParsedDoc,
+  fallbackIndex: number,
+): EvidenceBundle | null {
+  const args = parseToolArgs(call);
+  if (!args) return null;
+  // 允许模型不必精确给出 requirement_id：缺失时按工具调用顺序回退到对应要求
+  const target =
+    requirements.find((r) => r.id === args.requirementId) ?? requirements[fallbackIndex] ?? null;
+  if (!target) return null;
+  const hits = retrieve(`${args.intent} ${target.title} ${args.keywords.join(' ')}`, report.chunks, 4);
+  return {
+    requirementId: target.id,
+    chunkIds: hits.map((hit) => hit.chunk.id),
+    scores: hits.map((hit) => Number(hit.score.toFixed(2))),
+  };
+}
+
+/** 降级检索：模型未使用工具或工具失败时，仍由本地 BM25 逐条取证，保证链路可用 */
+function fallbackRetrieve(requirements: Requirement[], report: ParsedDoc): EvidenceBundle[] {
+  return requirements.map((requirement) => {
     const hits = retrieve(
       `${requirement.title} ${requirement.requirement} ${requirement.keywords.join(' ')}`,
       report.chunks,
@@ -233,12 +271,87 @@ export async function runCheck(options: RunCheckOptions): Promise<CheckOutput> {
       scores: hits.map((hit) => Number(hit.score.toFixed(2))),
     };
   });
+}
+
+/**
+ * 两阶段 Agent 工作流（含 Function Calling）：
+ * 阶段一：规划拆解要求；
+ * 阶段二：模型通过 retrieve_evidence 工具调用主动取证（工具执行失败自动降级为本地 BM25）；
+ * 阶段三：逐条判定 + 证据链硬校验。
+ * 默认 3 次模型调用；工具不可用时退化为 2 次，兼容低额度场景。
+ */
+export async function runCheck(options: RunCheckOptions): Promise<CheckOutput> {
+  const { taskText, report, onStage, onDelta, signal } = options;
+  const system: ChatMessage = { role: 'system', content: SYSTEM_PROMPT };
+
+  onStage('extracting', '阶段 1/3 · 拆解任务书要求', 'Agent 正在规划可核查项');
+  const requirementRaw = await callLlmText(
+    [system, { role: 'user', content: extractPrompt(taskText) }],
+    { maxTokens: 2048, signal },
+  );
+  const requirements = normalizeRequirements(parseJsonArray(requirementRaw));
+  if (requirements.length === 0) {
+    throw new Error('未能从任务书抽取到要求项，请检查任务书是否为有效文字内容');
+  }
+
+  onStage(
+    'retrieving',
+    `阶段 2/3 · Agent 调用检索工具取证（${requirements.length} 条要求）`,
+    'Function Calling · 模型自主决定检索意图 · BM25+章节加权',
+  );
+
+  // Function Calling：让模型为每条要求主动发起 retrieve_evidence 工具调用
+  const toolPrompt = `下面是要逐条核查的要求项。请为每一条要求调用一次 retrieve_evidence 工具，在实践报告中检索可用于判定的原文证据。
+要求：
+- requirements_id 填对应要求编号；intent 用一句话说明要找什么；keywords 给 2~6 个中文检索关键词。
+- 必须为每条要求各调用一次，不要遗漏，也不要在正文里输出解释。
+<要求项>
+${JSON.stringify(requirements, null, 1)}
+</要求项>`;
+
+  let bundles: EvidenceBundle[] = [];
+  let usedTool = false;
+  try {
+    const toolResult = await callLlm(
+      [system, { role: 'user', content: toolPrompt }],
+      {
+        tools: [RETRIEVE_TOOL],
+        toolChoice: 'required',
+        maxTokens: 2048,
+        signal,
+      },
+    );
+    toolResult.toolCalls.forEach((call, index) => {
+      const bundle = executeRetrieveTool(call, requirements, report, index);
+      if (bundle) bundles.push(bundle);
+    });
+    // 去重（同一要求保留首次工具结果），并对未覆盖的要求补一次检索
+    const seen = new Set<string>();
+    bundles = bundles.filter((item) => (seen.has(item.requirementId) ? false : (seen.add(item.requirementId), true)));
+    for (const requirement of requirements) {
+      if (!seen.has(requirement.id)) {
+        const [filler] = fallbackRetrieve([requirement], report);
+        if (filler) bundles.push(filler);
+      }
+    }
+    usedTool = toolResult.toolCalls.length > 0;
+  } catch {
+    // 模型不支持 Function Calling / 调用失败：降级为本地 BM25，保证链路可用
+    bundles = fallbackRetrieve(requirements, report);
+  }
   if (bundles.every((bundle) => bundle.chunkIds.length === 0)) {
     throw new Error('两份材料未检索到任何相关片段，请确认上传的是对应的任务书与报告');
   }
+  onStage(
+    'retrieving',
+    usedTool
+      ? `阶段 2/3 · 工具调用取证完成（${bundles.length} 条）`
+      : `阶段 2/3 · 检索完成（工具降级为本地 BM25，${bundles.length} 条）`,
+    usedTool ? '模型经 Function Calling 主动取证' : '当前模型未返回工具调用，已自动降级',
+  );
 
   onStage('judging', '阶段 3/3 · 逐条取证与一致性判定', '流式生成中 · 引用需可追溯');
-  const judgeRaw = await callLlm(
+  const judgeRaw = await callLlmText(
     [system, { role: 'user', content: judgePrompt(requirements, bundles, report.chunks) }],
     { stream: true, maxTokens: 4096, onDelta, signal },
   );

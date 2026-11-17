@@ -110,6 +110,20 @@ small { color: var(--muted); }
 .paste-box { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
 .paste-box textarea { width: 100%; resize: vertical; border: 1px solid var(--border); border-radius: 8px; padding: 8px; font-size: 12px; line-height: 1.6; outline: none; }
 .paste-box textarea:focus { border-color: var(--primary); }
+.multimodal-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.mm-btn {
+  display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; font-size: 11px;
+  border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2);
+  color: var(--text); cursor: pointer; transition: all 0.15s ease;
+}
+.mm-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+.mm-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.mm-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+.mm-btn.is-listening { border-color: var(--danger); color: var(--danger); background: var(--danger-soft); }
+.mm-btn.is-listening .mm-dot { background: var(--danger); animation: mm-pulse 1s infinite; }
+@keyframes mm-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+.multimodal-bar .link-btn { margin-left: auto; }
+.mm-hint { display: block; margin-top: 6px; font-size: 10px; color: var(--muted); line-height: 1.5; }
 
 /* ---------- Timeline ---------- */
 .timeline { list-style: none; margin: 0; padding: 0 0 0 6px; }

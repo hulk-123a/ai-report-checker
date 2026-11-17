@@ -5,10 +5,23 @@ import { SummaryBar } from './components/SummaryBar';
 import { Timeline } from './components/Timeline';
 import { UploadPanel } from './components/UploadPanel';
 import { buildMarkdown, downloadText } from './lib/export';
+import { isSpeechSupported } from './lib/multimodal';
 import { useChecker } from './state/useChecker';
 
 export default function App() {
-  const { state, loadFile, loadText, run, cancel, loadDemo, reset, busy } = useChecker();
+  const {
+    state,
+    loadFile,
+    loadText,
+    loadImage,
+    toggleVoice,
+    run,
+    cancel,
+    loadDemo,
+    reset,
+    busy,
+  } = useChecker();
+  const speechSupported = isSpeechSupported();
   const [activeId, setActiveId] = useState<string | null>(null);
   const [jump, setJump] = useState<{ id: string; seq: number } | null>(null);
   const seqRef = useRef(0);
@@ -60,7 +73,7 @@ export default function App() {
           </div>
         </div>
         <div className="header-actions">
-          <span className="tech-tags">React · RAG · Agent · 流式输出</span>
+          <span className="tech-tags">React · Function Calling · MCP · RAG · 多模态</span>
           <button type="button" className="btn btn-ghost btn-sm" onClick={loadDemo} disabled={busy}>
             离线演示
           </button>
@@ -93,7 +106,12 @@ export default function App() {
             doc={state.task}
             disabled={busy}
             onFile={(file) => loadFile('task', file)}
+            onImage={(file) => loadImage('task', file)}
             onText={(text) => loadText('task', text, '粘贴的任务书.txt')}
+            onVoice={() => toggleVoice('task')}
+            listening={state.listening && state.voiceDraft !== ''}
+            voiceDraft={state.voiceDraft}
+            speechSupported={speechSupported}
           />
           <UploadPanel
             kind="report"
@@ -102,7 +120,12 @@ export default function App() {
             doc={state.report}
             disabled={busy}
             onFile={(file) => loadFile('report', file)}
+            onImage={(file) => loadImage('report', file)}
             onText={(text) => loadText('report', text, '粘贴的实践报告.txt')}
+            onVoice={() => toggleVoice('report')}
+            listening={state.listening && state.voiceDraft !== ''}
+            voiceDraft={state.voiceDraft}
+            speechSupported={speechSupported}
           />
           <Timeline
             items={state.timeline}
@@ -132,14 +155,14 @@ export default function App() {
               <h2>把「要求」和「证据」对齐</h2>
               <p>AI Agent 会先拆解任务书，再逐条到报告中检索取证，最后给出可追溯的一致性结论。</p>
               <ol>
-                <li><span>1</span> 上传或粘贴任务书与实践报告（PDF / DOCX / TXT / MD）</li>
-                <li><span>2</span> 点击「开始核查」，观察右侧工作流与流式输出</li>
-                <li><span>3</span> 逐条查看结论，点击证据引用跳转报告原文，导出核查报告</li>
+                <li><span>1</span> 上传任务书与实践报告：支持 PDF / DOCX / TXT / MD，也支持图片截图 OCR、语音口述</li>
+                <li><span>2</span> 点击「开始核查」，观察 Agent 通过 Function Calling 自主调用检索工具取证</li>
+                <li><span>3</span> 逐条查看结论，点击证据引用跳转报告原文，导出可追溯的核查报告</li>
               </ol>
               <button type="button" className="btn btn-ghost" onClick={loadDemo} disabled={busy}>
                 暂无材料？先看离线演示
               </button>
-              <small>文档在浏览器本地解析，仅检索命中的片段会发送给模型。</small>
+              <small>文档在浏览器本地解析，仅检索命中的片段会发送给模型；密钥只存服务端。</small>
             </div>
           )}
         </section>

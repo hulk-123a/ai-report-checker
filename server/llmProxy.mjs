@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Readable } from 'node:stream';
 
-const MAX_BODY = 1024 * 1024; // 单次请求上限 1MB，避免异常请求打爆额度
+const MAX_BODY = 12 * 1024 * 1024; // 单次请求上限 12MB（视觉模态需容纳 base64 图片），仍设硬上限避免异常请求
 
 /** 读取 .env.local；系统环境变量优先级更高，便于云端部署时 injection */
 export function loadEnv() {
@@ -28,6 +28,9 @@ export function getConfig() {
     baseUrl: env.LLM_BASE_URL || 'https://api.deepseek.com/v1',
     model: env.LLM_MODEL || 'deepseek-chat',
     vision: String(env.LLM_VISION || 'false').toLowerCase() === 'true',
+    // 视觉/图像理解可独立指定基地址与模型；未指定则复用主模型（要求其兼容 image_url 多模态消息）
+    visionModel: env.LLM_VISION_MODEL || '',
+    visionBaseUrl: env.LLM_VISION_BASE_URL || '',
   };
 }
 
@@ -38,7 +41,7 @@ export function readBody(req) {
     req.on('data', (chunk) => {
       size += chunk.length;
       if (size > MAX_BODY) {
-        reject(new Error('请求体超过 1MB 限制'));
+        reject(new Error('请求体超过 12MB 限制'));
         req.destroy();
         return;
       }
@@ -87,19 +90,36 @@ export function createLlmHandler() {
       return sendJson(res, 400, { error: error.message });
     }
 
-    if (!Array.isArray(body.messages) || body.messages.length === 0 || body.messages.length > 20) {
+    if (!Array.isArray(body.messages) || body.messages.length === 0 || body.messages.length > 40) {
       return sendJson(res, 400, { error: 'messages 参数不合法' });
     }
 
-    const base = config.baseUrl.replace(/\/+$/, '');
+    // 视觉模态：需服务端显式启用，避免前端绕过配置直接调用付费视觉接口
+    const wantVision = Boolean(body.vision);
+    if (wantVision && !config.vision) {
+      return sendJson(res, 403, {
+        error: '视觉模态未启用。请在服务端 .env.local 设置 LLM_VISION=true 并可选用 LLM_VISION_MODEL / LLM_VISION_BASE_URL 指定视觉模型。',
+      });
+    }
+
+    // 基地址与模型一律由服务端环境变量决定，杜绝客户端传入造成 SSRF
+    const base = (wantVision ? config.visionBaseUrl || config.baseUrl : config.baseUrl).replace(/\/+$/, '');
     const endpoint = base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
     const payload = {
-      model: config.model,
+      model: wantVision ? config.visionModel || config.model : config.model,
       messages: body.messages,
       temperature: typeof body.temperature === 'number' ? body.temperature : 0.1,
       max_tokens: Math.min(Number(body.max_tokens) || 2048, 8192),
       stream: Boolean(body.stream),
     };
+
+    // Function Calling：透传工具定义与调用策略，返回完整 message（含 tool_calls）
+    if (Array.isArray(body.tools) && body.tools.length > 0 && body.tools.length <= 16) {
+      payload.tools = body.tools;
+      if (['auto', 'none', 'required'].includes(body.tool_choice) || typeof body.tool_choice === 'object') {
+        payload.tool_choice = body.tool_choice;
+      }
+    }
 
     let upstream;
     try {
